@@ -17,7 +17,6 @@ import {
   localizeMemoTemplateSeed,
 } from "@edgeever/shared/memo-template-seeds";
 import { createId, isoNow } from "./entity-utils";
-import { markWorkspaceExampleSeedPendingStatement } from "./workspace-example-seed";
 import { sha256 } from "./hash-utils";
 import type {
   DatabaseAdapter,
@@ -46,7 +45,7 @@ export type DefaultNotebookRow = {
   id: string;
   name: string;
   slug: string;
-  color: string | null;
+  color: string;
   sortOrder: number;
 };
 
@@ -328,7 +327,6 @@ export const ensureUserWorkspace = async (
       now,
     )),
     ...createWorkspaceDefaultSeedStatements(db, workspaceId, now, locale),
-    markWorkspaceExampleSeedPendingStatement(db, workspaceId, now),
   ]);
   return { workspaceId, role: "member" };
 };

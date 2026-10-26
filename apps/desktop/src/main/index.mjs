@@ -33,19 +33,18 @@ import { userDataDirectoryFromArguments } from "./user-data-directory.mjs";
 import { PRINT_PDF_OPTIONS } from "./print-pdf.mjs";
 import { isAllowedAppNavigation, isAllowedPrintPreviewUrl, isResourceDownloadUrl } from "./window-open-policy.mjs";
 import { showWindow } from "./window-visibility.mjs";
-import { formatGlobalShortcutForHumans, globalShortcutAccelerator, globalShortcutAcceleratorsConflict, normalizeGlobalShortcutBinding, parseStoredGlobalShortcuts, replaceGlobalShortcut, toggleMainWindow } from "./global-shortcut.mjs";
+import { globalShortcutAccelerator, normalizeGlobalShortcutBinding, replaceGlobalShortcut, toggleMainWindow } from "./global-shortcut.mjs";
 import { trayIconPath } from "./tray-icon.mjs";
 import { writeImageClipboard, writeRichClipboard, writeTextClipboard } from "./clipboard-write.mjs";
 import { registerClipboardReadIpc } from "./clipboard-read.mjs";
-import { captureRegionScreenToNote, captureScreenToNote, createScreenshotCaptureGuard, screenshotImportIpcPayload, writeScreenshotTempPath } from "./screenshot-capture.mjs";
-import { cancelScreenshotRegionSelection, openScreenshotRegionSelector } from "./screenshot-region.mjs";
+import { captureScreenToNote, createScreenshotCaptureGuard, screenshotImportIpcPayload, writeScreenshotTempPath } from "./screenshot-capture.mjs";
 import { LocalDataResetError, scheduleMacLocalDataReset } from "./local-data-reset.mjs";
 import { buildDesktopDiagnosticIssueUrl, normalizeDesktopDiagnostic } from "./desktop-diagnostics.mjs";
 import { readDesktopDeviceModel } from "./desktop-device-model.mjs";
 import { createRendererStartupGuard } from "./renderer-startup-guard.mjs";
 import { waitForChildProcessSpawn } from "./child-process-start.mjs";
 import { ScheduledTaskScheduler } from "./scheduled-task-scheduler.mjs";
-import { desktopMenuCopy, screenshotRegionCopy } from "./desktop-menu.mjs";
+import { desktopMenuCopy } from "./desktop-menu.mjs";
 import { createHeadingShortcutGuard } from "./heading-shortcut.mjs";
 import { buildEditContextMenuTemplate } from "./edit-context-menu.mjs";
 import {
@@ -203,24 +202,15 @@ let desktopSessionTokenOrigin = null;
 let instanceChangePending = false;
 let configuredGlobalShortcut = null;
 let registeredGlobalShortcut = null;
-let configuredScreenshotShortcut = null;
-let registeredScreenshotShortcut = null;
 let globalShortcutUpdate = Promise.resolve();
-const shortcutIsRegistered = (binding) => Boolean(binding && globalShortcut.isRegistered(globalShortcutAccelerator(binding)));
 const globalShortcutState = () => ({
   binding: configuredGlobalShortcut,
-  registered: shortcutIsRegistered(registeredGlobalShortcut),
-  screenshot: configuredScreenshotShortcut,
-  screenshotRegistered: shortcutIsRegistered(registeredScreenshotShortcut),
+  registered: Boolean(registeredGlobalShortcut && globalShortcut.isRegistered(globalShortcutAccelerator(registeredGlobalShortcut))),
 });
-const persistGlobalShortcutFile = async (slot, next) => {
+const persistGlobalShortcut = async (binding) => {
   const temporaryPath = `${globalShortcutPath()}.tmp`;
-  const payload = {
-    binding: slot === "binding" ? next : configuredGlobalShortcut,
-    screenshot: slot === "screenshot" ? next : configuredScreenshotShortcut,
-  };
   try {
-    await writeFile(temporaryPath, JSON.stringify(payload), { mode: 0o600 });
+    await writeFile(temporaryPath, JSON.stringify({ binding }), { mode: 0o600 });
     await rename(temporaryPath, globalShortcutPath());
   } catch (error) {
     await unlink(temporaryPath).catch(() => {});
@@ -232,77 +222,54 @@ const toggleWindowFromGlobalShortcut = () => toggleMainWindow({
   showWindow,
   activateApp: process.platform === "darwin" ? () => app.show() : undefined,
 });
-const captureScreenFromGlobalShortcut = () => { void captureScreenshotToNote(); };
-const registerLoadedShortcut = (slot, binding, callback) => {
-  const accelerator = globalShortcutAccelerator(binding);
+const loadGlobalShortcut = async () => {
+  try {
+    const stored = JSON.parse(await readFile(globalShortcutPath(), "utf8"));
+    configuredGlobalShortcut = normalizeGlobalShortcutBinding(stored?.binding);
+    if (configuredGlobalShortcut === undefined) configuredGlobalShortcut = null;
+  } catch {
+    configuredGlobalShortcut = null;
+  }
+  const accelerator = globalShortcutAccelerator(configuredGlobalShortcut);
   if (!accelerator) return;
   try {
-    if (globalShortcut.register(accelerator, callback)) {
-      if (slot === "screenshot") registeredScreenshotShortcut = binding;
-      else registeredGlobalShortcut = binding;
-      void writeDiagnostic("global-shortcut.registered", { slot, accelerator });
+    if (globalShortcut.register(accelerator, toggleWindowFromGlobalShortcut)) {
+      registeredGlobalShortcut = configuredGlobalShortcut;
+      void writeDiagnostic("global-shortcut.registered", { accelerator });
     } else {
-      void writeDiagnostic("global-shortcut.registration-failed", { slot, accelerator });
+      void writeDiagnostic("global-shortcut.registration-failed", { accelerator });
     }
   } catch (error) {
     void writeDiagnostic("global-shortcut.registration-failed", {
-      slot,
       accelerator,
       message: error instanceof Error ? error.message : String(error),
     });
     // Keep the preference so the user can change it when registration fails.
   }
 };
-const loadGlobalShortcut = async () => {
-  try {
-    const stored = JSON.parse(await readFile(globalShortcutPath(), "utf8"));
-    const parsed = parseStoredGlobalShortcuts(stored);
-    configuredGlobalShortcut = parsed.binding;
-    configuredScreenshotShortcut = parsed.screenshot;
-  } catch {
-    configuredGlobalShortcut = null;
-    configuredScreenshotShortcut = null;
-  }
-  registerLoadedShortcut("binding", configuredGlobalShortcut, toggleWindowFromGlobalShortcut);
-  registerLoadedShortcut("screenshot", configuredScreenshotShortcut, captureScreenFromGlobalShortcut);
-  refreshTrayMenu();
-};
-const setNamedGlobalShortcut = (slot, value, callback) => {
+const setGlobalShortcut = (value) => {
   const next = normalizeGlobalShortcutBinding(value);
   if (next === undefined) return Promise.resolve({ ...globalShortcutState(), error: "invalid" });
-  const other = slot === "screenshot" ? configuredGlobalShortcut : configuredScreenshotShortcut;
-  if (globalShortcutAcceleratorsConflict(next, other)) {
-    return Promise.resolve({ ...globalShortcutState(), error: "unavailable" });
-  }
-  const previous = slot === "screenshot" ? registeredScreenshotShortcut : registeredGlobalShortcut;
   const update = async () => {
     const result = await replaceGlobalShortcut({
       globalShortcut,
-      previous,
+      previous: registeredGlobalShortcut,
       next,
-      callback,
-      persist: (binding) => persistGlobalShortcutFile(slot, binding),
+      callback: toggleWindowFromGlobalShortcut,
+      persist: persistGlobalShortcut,
     });
     if (!result.ok) {
-      void writeDiagnostic("global-shortcut.update-failed", { slot, reason: result.reason });
+      void writeDiagnostic("global-shortcut.update-failed", { reason: result.reason });
       return { ...globalShortcutState(), error: result.reason };
     }
-    if (slot === "screenshot") {
-      configuredScreenshotShortcut = next;
-      registeredScreenshotShortcut = next;
-    } else {
-      configuredGlobalShortcut = next;
-      registeredGlobalShortcut = next;
-    }
-    refreshTrayMenu();
+    configuredGlobalShortcut = next;
+    registeredGlobalShortcut = next;
     return globalShortcutState();
   };
   const result = globalShortcutUpdate.then(update, update);
   globalShortcutUpdate = result.then(() => undefined, () => undefined);
   return result;
 };
-const setGlobalShortcut = (value) => setNamedGlobalShortcut("binding", value, toggleWindowFromGlobalShortcut);
-const setScreenshotShortcut = (value) => setNamedGlobalShortcut("screenshot", value, captureScreenFromGlobalShortcut);
 const sidecarDataDirectory = (accountId = null) => {
   return accountId
     ? accountDataDirectory(app.getPath("userData"), configuredApiBaseUrl, accountId)
@@ -785,11 +752,9 @@ const flushPendingScreenshotImport = () => {
 
 const captureScreenshotToNote = async () => {
   if (!screenshotCaptureGuard.tryBegin()) return;
-  const captureStartedAt = Date.now();
   const copy = desktopMenuCopy(app.getLocale());
   const wasVisible = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible());
   const revealWindow = () => {
-    if (isQuitting) return;
     if (process.platform === "darwin") app.show();
     showWindow(mainWindow);
   };
@@ -797,28 +762,13 @@ const captureScreenshotToNote = async () => {
     if (process.platform === "darwin") app.hide();
     else if (wasVisible) mainWindow.hide();
     await new Promise((resolve) => setTimeout(resolve, 250));
-    const captured = process.platform === "darwin"
-      ? await captureScreenToNote({
-        platform: process.platform,
-        locale: app.getLocale(),
-        outputPath: writeScreenshotTempPath(app.getPath("temp")),
-        desktopCapturer,
-        screen,
-      })
-      : await captureRegionScreenToNote({
-        locale: app.getLocale(),
-        desktopCapturer,
-        screen,
-        selectRegion: ({ display, image }) => openScreenshotRegionSelector({
-          BrowserWindow,
-          ipcMain,
-          display,
-          image,
-          copy: screenshotRegionCopy(app.getLocale()),
-          preloadPath: join(currentDirectory, "screenshot-region-preload.cjs"),
-          htmlPath: join(currentDirectory, "screenshot-region.html"),
-        }),
-      });
+    const captured = await captureScreenToNote({
+      platform: process.platform,
+      locale: app.getLocale(),
+      outputPath: process.platform === "darwin" ? writeScreenshotTempPath(app.getPath("temp")) : undefined,
+      desktopCapturer,
+      screen,
+    });
     if (!captured) {
       if (wasVisible) revealWindow();
       return;
@@ -830,15 +780,12 @@ const captureScreenshotToNote = async () => {
     void writeDiagnostic("screenshot.failed", {
       message: error instanceof Error ? error.message : String(error),
     });
-    if (!isQuitting) {
-      await dialog.showMessageBox({
-        type: "warning",
-        message: copy.screenshotFailed,
-      });
-    }
+    await dialog.showMessageBox({
+      type: "warning",
+      message: copy.screenshotFailed,
+    });
   } finally {
-    if (Date.now() - captureStartedAt >= 1000) screenshotCaptureGuard.release();
-    else screenshotCaptureGuard.end();
+    screenshotCaptureGuard.end();
   }
 };
 
@@ -960,13 +907,9 @@ const buildApplicationMenu = () => {
 
 const buildTrayContextMenu = () => {
   const copy = desktopMenuCopy(app.getLocale());
-  const screenshotShortcut = formatGlobalShortcutForHumans(configuredScreenshotShortcut);
   return Menu.buildFromTemplate([
     { label: copy.show, click: () => showWindow(mainWindow) },
-    {
-      label: screenshotShortcut ? `${copy.screenshotToNote}    ${screenshotShortcut}` : copy.screenshotToNote,
-      click: () => void captureScreenshotToNote(),
-    },
+    { label: copy.screenshotToNote, click: () => void captureScreenshotToNote() },
     ...(updateState === "downloaded" ? [{ label: copy.restartToUpdate, click: () => installDownloadedUpdate() }] : []),
     { type: "separator" },
     { label: copy.quit, click: () => { isQuitting = true; app.quit(); } },
@@ -1865,10 +1808,6 @@ const startApplication = async () => {
     if (event.sender !== mainWindow?.webContents) return null;
     return setGlobalShortcut(binding);
   });
-  ipcMain.handle("desktop:set-screenshot-shortcut", (event, binding) => {
-    if (event.sender !== mainWindow?.webContents) return null;
-    return setScreenshotShortcut(binding);
-  });
   ipcMain.handle("desktop:capture-global-shortcut", (event, capturing) => {
     if (event.sender !== mainWindow?.webContents || typeof capturing !== "boolean") return false;
     globalShortcut.setSuspended(capturing);
@@ -2394,7 +2333,6 @@ app.on("before-quit", (event) => {
   event.preventDefault();
   shutdownCleanupStarted = true;
   isQuitting = true;
-  cancelScreenshotRegionSelection();
   globalShortcut.unregisterAll();
   scheduledTaskScheduler.clear();
   rendererStartupGuard?.complete();
